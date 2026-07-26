@@ -1,84 +1,34 @@
 // CronFlex: Created by moaaz yahia zakaria (من صنع معاذ يحيى زكريا)
-// 2026
-export interface TaskOptions {
-  id?: string;
-  baseId?: string;
-  priority?: number | ((task: Task) => number);
-  delay?: number;
-  ttl?: number;
-  debounceInterval?: number;
-  throttleInterval?: number;
-  timeout?: number;
-  warningTimeout?: number;
-  retryAttempts?: number;
-  retryDelay?: number | ((attempt: number) => number);
-  fallback?: () => Promise<any> | any;
-  isPeriodic?: boolean;
-  periodInterval?: number;
-  group?: string;
-  tags?: string[];
-  registerName?: string;
-  dependencies?: string[];
-  [key: string]: any;
-}
 
-export type TaskExecuteFn = (...args: any[]) => Promise<any> | any;
+import {
+  TaskOptions,
+  TaskExecuteFn,
+  Task,
+  TaskPulseOptions,
+  HistoryItem,
+  MetricsStats,
+  MetricsResult,
+  EventCallback,
+} from "./types.js";
+import { TaskQueue } from "./queue.js";
+import { RateLimiter } from "./rateLimiter.js";
+import { TaskWorker } from "./worker.js";
 
-export interface Task {
-  options: TaskOptions;
-  execute: TaskExecuteFn & { isPlaceholder?: boolean };
-  status: "idle" | "running" | "completed" | "failed" | "expired";
-  currentAttempts: number;
-  enqueueTime: number;
-  controller?: AbortController;
-  registerName?: string;
-  args?: any[];
-  [key: string]: any;
-}
-
-export interface TaskPulseOptions {
-  concurrency?: number;
-  rateMax?: number;
-  rateWindow?: number;
-  persist?: boolean;
-  saveState?: (state: any[]) => Promise<void> | void;
-  loadState?: () => Promise<any[]> | any[];
-  agingRate?: number;
-  historyLimit?: number;
-  redisUrl?: string;
-  redis?: any;
-  redisKey?: string;
-}
-
-export interface HistoryItem {
-  id: string;
-  status: string;
-  error: string | null;
-  duration: number;
-  timestamp: number;
-}
-
-export interface MetricsStats {
-  avgRuntimeMs: number;
-  avgLatencyMs: number;
-  successRatePercent: number;
-  totalSuccess: number;
-  totalFail: number;
-}
-
-export interface MetricsResult {
-  queue: number;
-  running: number;
-  completed: number;
-  failed: number;
-  tokens: number;
-  isPaused: boolean;
-  stats: MetricsStats;
-}
-
-export type EventCallback = (...args: any[]) => void;
+export {
+  TaskOptions,
+  TaskExecuteFn,
+  Task,
+  TaskPulseOptions,
+  HistoryItem,
+  MetricsStats,
+  MetricsResult,
+  EventCallback,
+};
 
 export class TaskPulse {
+  public taskQueue: TaskQueue;
+  public rateLimiter: RateLimiter;
+
   public queue: Map<string, Task>;
   public completed: Set<string>;
   public deadLetters: Map<string, Task>;
@@ -90,7 +40,6 @@ export class TaskPulse {
   public concurrency: number;
   public rateMax: number;
   public rateWindow: number;
-  public tokens: number;
   public persist: boolean;
   public saveState?: (state: any[]) => Promise<void> | void;
   public loadState?: () => Promise<any[]> | any[];
@@ -116,15 +65,21 @@ export class TaskPulse {
   [key: string]: any;
 
   constructor(opts: TaskPulseOptions = {}) {
-    this.queue = new Map();
-    this.completed = new Set();
-    this.deadLetters = new Map();
+    this.taskQueue = new TaskQueue();
+    this.queue = this.taskQueue.queue;
+    this.completed = this.taskQueue.completed;
+    this.deadLetters = this.taskQueue.deadLetters;
+
     this.registry = new Map();
     this.running = 0;
     this.concurrency = opts.concurrency ?? 3;
     this.rateMax = opts.rateMax ?? 10;
     this.rateWindow = opts.rateWindow ?? 1000;
-    this.tokens = 0;
+
+    this.rateLimiter = new RateLimiter(this.rateMax, this.rateWindow);
+    this.debounceMap = this.rateLimiter.debounceMap;
+    this.throttleMap = this.rateLimiter.throttleMap;
+
     this.persist = opts.persist ?? false;
     this.saveState = opts.saveState;
     this.loadState = opts.loadState;
@@ -142,9 +97,6 @@ export class TaskPulse {
       totalFail: 0,
       totalLatency: 0,
     };
-
-    this.debounceMap = new Map();
-    this.throttleMap = new Map();
 
     this.listeners = {
       start: [],
@@ -168,8 +120,8 @@ export class TaskPulse {
     }
 
     this.intervalId = setInterval(() => {
-      this.tokens = 0;
-      this.cleanMaps();
+      this.rateLimiter.resetTokens();
+      this.rateLimiter.cleanMaps();
       if (!this.isPaused) {
         this.tick().catch((err) => this.emit("fail", "system", err));
       }
@@ -180,14 +132,12 @@ export class TaskPulse {
     }
   }
 
-  private cleanMaps(): void {
-    const now = Date.now();
-    for (const [key, time] of this.debounceMap.entries()) {
-      if (now - time > 60000) this.debounceMap.delete(key);
-    }
-    for (const [key, time] of this.throttleMap.entries()) {
-      if (now - time > 60000) this.throttleMap.delete(key);
-    }
+  // Getter/Setter to sync with this.rateLimiter.tokens
+  public get tokens(): number {
+    return this.rateLimiter.tokens;
+  }
+  public set tokens(val: number) {
+    this.rateLimiter.tokens = val;
   }
 
   public on(event: string, listener: EventCallback): void {
@@ -233,24 +183,18 @@ export class TaskPulse {
       resolvedOptions.debounceInterval &&
       typeof resolvedOptions.debounceInterval === "number"
     ) {
-      const now = Date.now();
-      const last = this.debounceMap.get(trackingKey) || 0;
-      if (now - last < resolvedOptions.debounceInterval) {
+      if (this.rateLimiter.checkDebounce(trackingKey, resolvedOptions.debounceInterval)) {
         return;
       }
-      this.debounceMap.set(trackingKey, now);
     }
 
     if (
       resolvedOptions.throttleInterval &&
       typeof resolvedOptions.throttleInterval === "number"
     ) {
-      const now = Date.now();
-      const last = this.throttleMap.get(trackingKey) || 0;
-      if (now - last < resolvedOptions.throttleInterval) {
+      if (this.rateLimiter.checkThrottle(trackingKey, resolvedOptions.throttleInterval)) {
         return;
       }
-      this.throttleMap.set(trackingKey, now);
     }
 
     const task: Task = {
@@ -447,12 +391,14 @@ export class TaskPulse {
 
   public setRateLimit(max: number, window?: number): void {
     this.rateMax = max;
+    this.rateLimiter.limit = max;
     if (window !== undefined) {
       this.rateWindow = window;
+      this.rateLimiter.window = window;
       clearInterval(this.intervalId);
       this.intervalId = setInterval(() => {
-        this.tokens = 0;
-        this.cleanMaps();
+        this.rateLimiter.resetTokens();
+        this.rateLimiter.cleanMaps();
         if (!this.isPaused) {
           this.tick().catch((err) => this.emit("fail", "system", err));
         }
@@ -501,12 +447,7 @@ export class TaskPulse {
   }
 
   public cascadeCancel(parentId: string): void {
-    this.queue.delete(parentId);
-    for (const [id, task] of this.queue.entries()) {
-      if (task.options.dependencies?.includes(parentId)) {
-        this.cascadeCancel(id);
-      }
-    }
+    this.taskQueue.cascadeCancel(parentId);
   }
 
   public retryFailed(id: string): boolean {
@@ -589,50 +530,18 @@ export class TaskPulse {
   }
 
   public getSortedIdleTasks(): Task[] {
-    const now = Date.now();
-    return Array.from(this.queue.values())
-      .filter((t) => {
-        if (t.status !== "idle" || (t.execute && t.execute.isPlaceholder)) {
-          return false;
-        }
-
-        if (t.options.ttl && now - t.enqueueTime > t.options.ttl) {
-          t.status = "expired";
-          this.emit("expired", t.options.id!);
-          this.fail(
-            t,
-            new Error(`Task expired: exceeded TTL of ${t.options.ttl}ms`),
-          );
-          return false;
-        }
-        return true;
-      })
-      .sort((a, b) => {
-        let priorityA =
-          typeof a.options.priority === "function"
-            ? a.options.priority(a)
-            : a.options.priority || 0;
-        let priorityB =
-          typeof b.options.priority === "function"
-            ? b.options.priority(b)
-            : b.options.priority || 0;
-
-        if (this.agingRate) {
-          const waitA = now - (a.enqueueTime || now);
-          const waitB = now - (b.enqueueTime || now);
-          priorityA += waitA * this.agingRate;
-          priorityB += waitB * this.agingRate;
-        }
-
-        return priorityB - priorityA;
-      });
+    return this.taskQueue.getSortedIdleTasks(
+      this.agingRate,
+      (id) => this.emit("expired", id),
+      (task, err) => this.fail(task, err),
+    );
   }
 
   public async tick(): Promise<void> {
     if (
       this.isPaused ||
       this.running >= this.concurrency ||
-      this.tokens >= this.rateMax
+      this.rateLimiter.isRateLimited()
     )
       return;
 
@@ -651,7 +560,7 @@ export class TaskPulse {
         : firstTask.options.priority || 0;
 
     for (const task of sorted) {
-      if (this.running >= this.concurrency || this.tokens >= this.rateMax)
+      if (this.running >= this.concurrency || this.rateLimiter.isRateLimited())
         break;
 
       const currentPriority =
@@ -674,7 +583,7 @@ export class TaskPulse {
 
       task.status = "running";
       this.running++;
-      this.tokens++;
+      this.rateLimiter.consume();
 
       this.run(task).catch(() => {});
     }
@@ -683,45 +592,17 @@ export class TaskPulse {
   public async run(task: Task): Promise<void> {
     this.emit("start", task.options.id!);
 
-    const startTime = Date.now();
-    const latency = startTime - (task.enqueueTime || startTime);
-
-    const controller = new AbortController();
-    task.controller = controller;
-
-    let timeoutId: NodeJS.Timeout | undefined;
-    if (task.options.timeout) {
-      timeoutId = setTimeout(() => controller.abort(), task.options.timeout);
-    }
-
-    let warningTimeoutId: NodeJS.Timeout | undefined;
-    if (task.options.warningTimeout) {
-      warningTimeoutId = setTimeout(() => {
-        this.emit(
-          "timeout-warning",
-          task.options.id!,
-          task.options.warningTimeout!,
-        );
-      }, task.options.warningTimeout);
-    }
+    const startTimeStamp = Date.now();
+    const latency = startTimeStamp - (task.enqueueTime || startTimeStamp);
 
     try {
-      for (const hook of this.beforeHooks) {
-        await hook(task);
-      }
-
-      const progress = (percent: number) => {
-        this.emit("progress", task.options.id!, percent);
-      };
-
-      const result = await task.execute(controller.signal, progress);
-
-      if (timeoutId) clearTimeout(timeoutId);
-      if (warningTimeoutId) clearTimeout(warningTimeoutId);
-
-      for (const hook of this.afterHooks) {
-        await hook(task, result);
-      }
+      const { result, startTime } = await TaskWorker.executeTask(
+        task,
+        this.beforeHooks,
+        this.afterHooks,
+        (event, ...args) => this.emit(event, ...args),
+        (id, percent) => this.emit("progress", id, percent),
+      );
 
       task.status = "completed";
       this.completed.add(task.options.id!);
@@ -745,13 +626,10 @@ export class TaskPulse {
         this.queue.delete(task.options.id!);
       }
     } catch (error: any) {
-      if (timeoutId) clearTimeout(timeoutId);
-      if (warningTimeoutId) clearTimeout(warningTimeoutId);
-
       task.currentAttempts++;
 
       const isAborted =
-        controller.signal.aborted || error.name === "AbortError";
+        task.controller?.signal.aborted || error.name === "AbortError";
 
       if (
         !isAborted &&
@@ -759,13 +637,7 @@ export class TaskPulse {
         task.currentAttempts <= task.options.retryAttempts
       ) {
         task.status = "idle";
-        let delay: number;
-        if (typeof task.options.retryDelay === "function") {
-          delay = task.options.retryDelay(task.currentAttempts);
-        } else {
-          const baseDelay = task.options.retryDelay ?? 1000;
-          delay = baseDelay * Math.pow(2, task.currentAttempts - 1);
-        }
+        const delay = TaskWorker.calculateRetryDelay(task, task.currentAttempts);
         setTimeout(() => {
           if (!this.isPaused) this.tick().catch(() => {});
         }, delay);
@@ -778,10 +650,10 @@ export class TaskPulse {
           });
           this.queue.delete(task.options.id!);
         } catch (fbError) {
-          this.fail(task, fbError, startTime, latency);
+          this.fail(task, fbError, startTimeStamp, latency);
         }
       } else {
-        this.fail(task, error, startTime, latency);
+        this.fail(task, error, startTimeStamp, latency);
       }
     } finally {
       this.running--;
@@ -874,17 +746,17 @@ export class TaskPulse {
       process.versions.node
     ) {
       try {
-        const fs = await import("fs");
-        const path = await import("path");
-        const filePath = path.join(process.cwd(), "tasks_persist.json");
+        const fsLib = await import("fs");
+        const pathLib = await import("path");
+        const filePath = pathLib.join(process.cwd(), "tasks_persist.json");
 
         this.saveState = (state) => {
-          fs.writeFileSync(filePath, JSON.stringify(state, null, 2));
+          fsLib.writeFileSync(filePath, JSON.stringify(state, null, 2));
         };
         this.loadState = () => {
           try {
-            if (fs.existsSync(filePath)) {
-              return JSON.parse(fs.readFileSync(filePath, "utf8"));
+            if (fsLib.existsSync(filePath)) {
+              return JSON.parse(fsLib.readFileSync(filePath, "utf8"));
             }
           } catch (e) {}
           return [];
