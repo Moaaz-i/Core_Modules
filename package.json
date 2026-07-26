@@ -1,0 +1,20 @@
+{
+  "name": "ts-runner",
+  "version": "1.0.0",
+  "description": "Run TypeScript files directly without compiling to JS",
+  "main": "index.ts",
+  "type": "module",
+  "scripts": {
+    "start": "tsx index.ts",
+    "dev": "tsx watch index.ts"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^20.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "express": "^5.2.1"
+  }
+}

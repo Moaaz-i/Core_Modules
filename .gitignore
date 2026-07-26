@@ -1,0 +1,9 @@
+node_modules/
+tasks_persist.json
+.DS_Store
+temp_assignment/
+temp_folder/
+temp_delete.txt
+notes.txt
+async.txt
+.gemini/
