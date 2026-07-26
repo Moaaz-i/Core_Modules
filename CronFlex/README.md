@@ -2,7 +2,7 @@
 
 A robust, modular task queue and rate-limiting library for Node.js and browser environments.
 
-Created by: **moaaz yahia zakaria** (من صنع معاذ يحيى زكريا)
+Created by: **moaaz yahia zakaria**
 
 ## Features
 - **Task Prioritization**: Enqueue tasks with dynamic priority or aging rate.

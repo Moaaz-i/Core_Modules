@@ -21,14 +21,9 @@ jobs:
         run: npm install
 
       - name: Build Library
-        run: |
-          cd CronFlex
-          npm install
-          npm run build
+        run: npm run build
 
       - name: Publish to npm
-        run: |
-          cd CronFlex
-          npm publish
+        run: npm publish
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
