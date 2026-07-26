@@ -15,6 +15,7 @@
     "typescript": "^5.0.0"
   },
   "dependencies": {
+    "cronflex": "^1.0.0",
     "express": "^5.2.1"
   }
 }
