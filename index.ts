@@ -1,5 +1,5 @@
 import fs from "fs";
-import { TaskPulse } from "../CronFlex/src/index.js";
+import { TaskPulse } from "cronflex";
 import * as assignment from "./assignment2.js";
 import { findKthPositive } from "./bonus.js";
 
